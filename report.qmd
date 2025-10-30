@@ -1,34 +1,233 @@
 ---
-title: "EV Power - Lab 4 Project Report"
-format: typst
+title: "EV Power – Lab 4 Project Report"
+format: pdf
+execute:
+  echo: false
+  warning: false
+  message: false
 ---
 
-# Example Solution 1
+## Overview
+This report investigates whether states with a cleaner electricity mix (higher renewable share) also tend to have more electric vehicle (EV) registrations in 2023. I (i) build a 2021–2023 panel by joining the provided CSV files, (ii) compute the renewable share of total energy use, and (iii) visualize a 2023 choropleth map and a bivariate scatter plot with a fitted line.
 
-## **Part 0: libraries**
-
+## Setup
 ```{r}
+library(tidyverse); library(janitor); library(readr)
+library(scales); library(maps); library(stringr); library(knitr)
+
+theme_set(ggplot2::theme_minimal())
+options(dplyr.summarise.inform = FALSE)
+
+std_state <- function(x) {
+  x |>
+    stringr::str_squish() |>
+    stringr::str_to_lower() |>
+    stringr::str_replace_all("\\.", "")
+}
 
 ```
 
-## **Part 1:** **Defining Research Question**
-
-Chosen Question:
-
-## **Part 2: Data Preparation and Cleaning**
+## Data and Methods
 
 ```{r}
+#| label: data-and-methods
+data_dir <- "data"
+stopifnot(dir.exists(data_dir))
+years <- 2021:2023
 
+# ---------- helpers ----------
+find_one <- function(pattern) {
+  hits <- list.files(data_dir, pattern = pattern, full.names = TRUE,
+                     recursive = FALSE, ignore.case = TRUE)
+  if (!length(hits)) stop(sprintf("No file matched: %s\nHave: %s",
+                                  pattern, paste(list.files(data_dir), collapse = ", ")))
+  hits[1]
+}
+abbr_to_full <- function(x) {
+  x  <- stringr::str_trim(x)
+  ab <- stringr::str_to_upper(x)
+  ab <- stringr::str_replace_all(ab, "0", "O")  # fix C0->CO
+  full <- state.name[match(ab, state.abb)]
+  full <- ifelse(is.na(full), stringr::str_to_title(x), full)
+  std_state(full)
+}
+
+# 兜底：若目标列不存在，就把“第一个数值列（排除 year）”重命名为目标列
+canonize_numeric <- function(df, target, exclude = c("year")) {
+  if (!target %in% names(df)) {
+    cand <- names(df)[sapply(df, is.numeric)]
+    cand <- setdiff(cand, exclude)
+    if (!length(cand)) stop(sprintf("No numeric column to map to %s", target))
+    df <- dplyr::rename(df, !!target := dplyr::all_of(cand[1]))
+  }
+  df
+}
+
+# ---------- locate files ----------
+renew_files <- sapply(years, function(y)
+  find_one(sprintf("^renew[-_]?use[-_]?%d\\.(csv|csv\\.gz)$", y)))
+total_files <- sapply(years, function(y)
+  find_one(sprintf("^total[-_]?use[-_]?%d\\.(csv|csv\\.gz)$", y)))
+price_file  <- find_one("^(av|avg)[-_]?energy[-_]?price.*2021.*2023.*\\.(csv|csv\\.gz)$")
+ev_file     <- find_one("^ev[-_]?registrations.*2023.*\\.(csv|csv\\.gz)$")
+
+# ---------- load & clean renew (long-by-source -> sum by state) ----------
+renew <- dplyr::bind_rows(lapply(seq_along(years), function(i) {
+  df <- readr::read_csv(renew_files[i], show_col_types = FALSE) |>
+    janitor::clean_names()
+  st_col  <- names(df)[stringr::str_detect(names(df), "^state$|state_name")]
+  val_col <- names(df)[stringr::str_detect(names(df), "20\\d{2}")]
+  if (!length(st_col) || !length(val_col))
+    stop("`renew-use` is missing expected State or year column.")
+  df |>
+    dplyr::transmute(
+      state = abbr_to_full(.data[[st_col[1]]]),
+      value = readr::parse_number(as.character(.data[[val_col[1]]]))
+    ) |>
+    dplyr::group_by(state) |>
+    dplyr::summarise(renew_gwh = sum(value, na.rm = TRUE), .groups = "drop") |>
+    dplyr::mutate(year = years[i])
+}))
+
+# --- load & clean total (wide states -> long -> sum by state) ---
+total <- dplyr::bind_rows(lapply(seq_along(years), function(i) {
+  df <- readr::read_csv(total_files[i], show_col_types = FALSE) |>
+    janitor::clean_names()
+
+  # 1) 识别“州缩写列”：ak, al, ...（clean_names 后都是小写）
+  nms <- names(df)
+  state_cols <- nms[tolower(nms) %in% c(tolower(state.abb), "dc")]
+
+  # 2) 若没识别到，就退化为“除了第一列（energy_source）以外的所有列”
+  if (!length(state_cols)) {
+    state_cols <- nms[-1]
+  }
+
+  # 3) 打印自检（渲染日志中可见）
+  message("total ", years[i], " using state cols: ", paste(state_cols, collapse = ", "))
+
+  # 4) 宽转长 → 解析数字 → 按州求和
+  df_long <- df |>
+    tidyr::pivot_longer(cols = tidyselect::all_of(state_cols),
+                        names_to = "state_abbr",
+                        values_to = "val_raw")
+
+  df_long |>
+    dplyr::mutate(
+      state = abbr_to_full(state_abbr),
+      val   = readr::parse_number(as.character(val_raw))
+    ) |>
+    dplyr::group_by(state) |>
+    dplyr::summarise(total_gwh = sum(val, na.rm = TRUE), .groups = "drop") |>
+    dplyr::mutate(year = years[i])
+}))
+
+
+# ---------- load & clean price (messy lines -> rebuild CSV) ----------
+price_lines <- readr::read_lines(price_file)
+price_lines <- price_lines[grepl(",", price_lines)]
+price_wide  <- readr::read_csv(I(paste(price_lines, collapse = "\n")), show_col_types = FALSE)
+price <- price_wide |>
+  janitor::clean_names() |>
+  dplyr::rename(state_raw = tidyselect::matches("^state$|state_name")) |>
+  tidyr::pivot_longer(cols = tidyselect::matches("20\\d{2}"),
+                      names_to = "year",
+                      values_to = "price_raw") |>
+  dplyr::mutate(
+    year  = readr::parse_integer(stringr::str_extract(year, "\\d{4}")),
+    state = abbr_to_full(state_raw),
+    price_cents_per_kwh = readr::parse_number(as.character(price_raw))
+  ) |>
+  dplyr::select(state, year, price_cents_per_kwh)
+
+# ---------- load & clean EV (messy header -> rebuild CSV) ----------
+ev_lines <- readr::read_lines(ev_file)
+ev_lines <- ev_lines[grepl(",", ev_lines)]
+ev_raw   <- readr::read_csv(I(paste(ev_lines, collapse = "\n")), show_col_types = FALSE) |>
+  janitor::clean_names()
+st_col    <- if ("state" %in% names(ev_raw)) "state" else names(ev_raw)[1]
+count_col <- setdiff(names(ev_raw), st_col)[1]
+ev23 <- ev_raw |>
+  dplyr::transmute(
+    state = abbr_to_full(.data[[st_col]]),
+    year  = 2023,
+    ev_registrations = readr::parse_number(as.character(.data[[count_col]]))
+  )
+
+# ---------- canonicalize & keep only needed cols ----------
+renew <- canonize_numeric(renew, "renew_gwh") |>
+  dplyr::select(state, year, renew_gwh)
+total <- canonize_numeric(total, "total_gwh") |>
+  dplyr::select(state, year, total_gwh)
+price <- canonize_numeric(price, "price_cents_per_kwh") |>
+  dplyr::select(state, year, price_cents_per_kwh)
+ev23  <- canonize_numeric(ev23,  "ev_registrations") |>
+  dplyr::select(state, year, ev_registrations)
+
+# ---------- build panel & 2023 table ----------
+panel <- renew |>
+  dplyr::left_join(total, by = c("state","year")) |>
+  dplyr::mutate(
+    renew_share = dplyr::if_else(total_gwh > 0, renew_gwh / total_gwh, NA_real_)
+  ) |>
+  dplyr::left_join(price, by = c("state","year"))
+
+df23 <- panel |>
+  dplyr::filter(year == 2023, !is.na(state)) |>
+  dplyr::left_join(ev23, by = c("state","year")) |>
+  dplyr::filter(state != "district of columbia") |>
+  dplyr::mutate(
+    ev_per_twh = dplyr::if_else(total_gwh > 0, ev_registrations / (total_gwh/1000), NA_real_)
+  )
+
+# quick sanity checks (you can comment these out later)
+stopifnot(all(c("state","year","renew_gwh") %in% names(renew)))
+stopifnot(all(c("state","year","total_gwh") %in% names(total)))
+stopifnot(all(c("state","year","price_cents_per_kwh") %in% names(price)))
+stopifnot(all(c("state","year","ev_registrations") %in% names(ev23)))
+
+knitr::kable(
+  df23 |> dplyr::select(state, renew_share, ev_registrations, price_cents_per_kwh, ev_per_twh) |> head(10),
+  caption = "Joined 2023 state-level data (first rows)."
+)
 ```
 
-## **Part 3: Joining / Pivoting Datasets for Analysis**
-
+## Map Visualization
 ```{r}
+# Choropleth of 2023 renewable share
 
+us_poly <- maps::map_data("state") |>
+tibble::as_tibble() |>
+dplyr::rename(state = region)
+
+map_df <- us_poly |>
+dplyr::left_join(df23, by = "state")
+
+ggplot2::ggplot(map_df, ggplot2::aes(long, lat, group = group, fill = renew_share)) +
+ggplot2::geom_polygon(color = "white", linewidth = 0.1) +
+ggplot2::coord_fixed(1.3) +
+ggplot2::scale_fill_continuous(labels = scales::percent_format(accuracy = 1), na.value = "grey90") +
+ggplot2::labs(title = "Share of Renewable Energy by State (2023)", fill = "Renewable Share") +
+ggplot2::theme_void() +
+ggplot2::theme(legend.position = "right", plot.title = ggplot2::element_text(face = "bold"))
 ```
 
-## **Part 4: Mapping Visualization**
-
+## Analysis
 ```{r}
+# Association between renewable share and EV registrations
 
+cor_val <- stats::cor(df23$renew_share, df23$ev_registrations, use = "complete.obs")
+
+ggplot2::ggplot(df23, ggplot2::aes(x = renew_share, y = ev_registrations)) +
+ggplot2::geom_point(alpha = 0.75) +
+ggplot2::geom_smooth(method = "lm", se = FALSE) +
+ggplot2::scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+ggplot2::labs(title = "EV Registrations vs Renewable Share (2023)",
+x = "Renewable share of total energy use",
+y = "EV registrations (count)") +
+ggplot2::annotate("text",
+x = 0.02,
+y = max(df23$ev_registrations, na.rm = TRUE),
+label = paste0("Correlation = ", round(cor_val, 2)),
+hjust = 0)
 ```
